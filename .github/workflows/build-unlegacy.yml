@@ -1,0 +1,263 @@
+name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
+
+# Manual only: Actions tab -> "Build Unlegacy-Android 6.0 (Galaxy Tab 2)" -> Run workflow.
+# Needs a PUBLIC repository: only public repos get the 4 vCPU / 16 GB runner; private ones get 2 vCPU / 8 GB,
+# which will not finish inside GitHub's 6-hour job limit. Not run end-to-end yet (see UA-ACTIONS-README.md).
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "espresso3g = Tab 2 3G (P3100/P5100) | espresso = Tab 2 Wi-Fi (P3110/P5110)"
+        type: choice
+        options: [espresso3g, espresso]
+        default: espresso3g
+      variant:
+        description: "user = like the old official builds | userdebug = adb root / debugging"
+        type: choice
+        options: [user, userdebug]
+        default: user
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unlegacy-build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UA_DEVICE: ${{ inputs.device }}
+  UA_LUNCH: ua_${{ inputs.device }}-${{ inputs.variant }}
+  UA_BRANCH: aosp-6.0
+  UA_MANIFEST: https://github.com/Unlegacy-Android/android.git
+
+jobs:
+  build:
+    name: ${{ inputs.device }}-${{ inputs.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Start
+        run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+          echo "Target: $UA_LUNCH"
+          nproc; free -m; df -h / /mnt
+
+      - name: Remove preinstalled software we do not need
+        run: |
+          sudo rm -rf /usr/share/swift /usr/local/julia* /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/aws-cli /usr/local/aws-sam-cli /usr/local/.ghcup /usr/local/lib/heroku /usr/share/miniconda \
+            /opt/hostedtoolcache /opt/microsoft /opt/google /opt/az /usr/lib/google-cloud-sdk /usr/lib/mono /usr/lib/firefox || true
+          df -h /
+
+      # Pinned to a commit (master as of 2025-03-28). Merges the free space of / and /mnt into one volume at /ua.
+      - name: Merge free disk space into one big volume at /ua
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+        with:
+          build-mount-path: /ua
+          root-reserve-mb: 8192
+          temp-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Prepare /ua
+        run: |
+          sudo mkdir -p /ua
+          sudo chown "$USER":"$(id -gn)" /ua
+          mkdir -p /ua/src /ua/ccache /ua/home /ua/dist /ua/logs /ua/image /ua/tmp
+          chmod 1777 /ua/tmp
+          df -h / /mnt /ua; free -m
+          avail=$(df -BG --output=avail /ua | tail -n1 | tr -dc 0-9)
+          echo "Free space on /ua: ${avail} GB"
+          if [ "$avail" -lt 30 ]; then echo "::error::Only ${avail} GB free on /ua; the build needs roughly 45 GB."; exit 1; fi
+          if [ "$avail" -lt 45 ]; then echo "::warning::Only ${avail} GB free on /ua - tight. Watch the disk_free heartbeat lines in the build step."; fi
+
+      - name: Build the Ubuntu 18.04 build image
+        run: |
+          cd /ua/image
+          cat > Dockerfile <<'EOF'
+          ARG BASE=docker.io/library/ubuntu:18.04
+          FROM ${BASE}
+          ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+          RUN (apt-get update || (sed -i -E 's#https?://[a-z.]*ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' /etc/apt/sources.list && apt-get update)) \
+           && apt-get install -y --no-install-recommends openjdk-8-jdk python git curl ca-certificates ccache flex bison gperf build-essential zip unzip zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev libncurses5 libtinfo5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc bc lzop libssl-dev file rsync procps less xz-utils gawk patch perl \
+           && (update-java-alternatives -s java-1.8.0-openjdk-amd64 || true) \
+           && apt-get clean && rm -rf /var/lib/apt/lists/*
+          EOF
+          ok=0
+          for base in docker.io/library/ubuntu:18.04 mirror.gcr.io/library/ubuntu:18.04; do
+            if docker build --build-arg "BASE=$base" -t ua-aosp60:bionic .; then ok=1; break; fi
+            echo "::warning::image build failed on $base"
+          done
+          [ "$ok" = 1 ] || { echo "::error::could not build the Ubuntu 18.04 image"; exit 1; }
+          docker run --rm ua-aosp60:bionic bash -c 'javac -version 2>&1; python --version 2>&1; make --version | head -n1'
+          docker run --rm ua-aosp60:bionic bash -c 'javac -version 2>&1 | grep -q "1\.8" && python --version 2>&1 | grep -q "2\.7"'
+
+      - name: Install repo and a git identity
+        run: |
+          sudo curl -fsSL --retry 5 --retry-delay 5 -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          sudo chmod +x /usr/local/bin/repo
+          git config --global user.name "UA Builder"
+          git config --global user.email "ua-builder@localhost"
+          git config --global color.ui false
+          git config --global --add safe.directory '*'
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 120
+          cp ~/.gitconfig /ua/home/.gitconfig   # the container's HOME: lets 'git am' (vendorsetup.sh patches) work as root
+
+      - name: repo init + sync (retries with back-off)
+        run: |
+          cd /ua/src
+          python3 /usr/local/bin/repo init -u "$UA_MANIFEST" -b "$UA_BRANCH" --depth=1 --no-clone-bundle </dev/null
+          for n in 1 2 3 4 5 6; do
+            echo "::group::repo sync attempt $n"
+            if python3 /usr/local/bin/repo sync -c --no-tags --no-clone-bundle --force-sync -j8 </dev/null; then echo "::endgroup::"; break; fi
+            echo "::endgroup::"
+            [ "$n" -lt 6 ] || { echo "::error::repo sync failed 6 times"; exit 1; }
+            sleep $((n * 30))
+          done
+          for f in Makefile build/envsetup.sh vendor/unlegacy/vendorsetup.sh device/samsung/espresso3g/BoardConfig.mk device/samsung/espresso prebuilts/gcc/linux-x86/arm/arm-eabi-4.7; do
+            [ -e "$f" ] || { echo "::error::$f is missing after sync"; exit 1; }
+          done
+          df -h /ua
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: /ua/ccache
+          key: ccache-${{ inputs.device }}-${{ inputs.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ inputs.device }}-${{ inputs.variant }}-
+            ccache-${{ inputs.device }}-
+            ccache-
+
+      - name: Build (make otapackage inside the Ubuntu 18.04 container)
+        id: build
+        timeout-minutes: 350
+        run: |
+          cat > /ua/in-container.sh <<'EOF'
+          set +eu
+          ulimit -n "$(ulimit -Hn)" 2>/dev/null
+          export LC_ALL=C USE_CCACHE=1 CCACHE_DIR=/ccache CCACHE_COMPRESS=1
+          cd /src || exit 90
+          echo "container: $(javac -version 2>&1) | $(python --version 2>&1) | $(make --version | head -n1) | nproc=$(nproc)"
+          prebuilts/misc/linux-x86/ccache/ccache -M 6G || echo "ccache -M failed (continuing)"
+          . build/envsetup.sh || { echo "envsetup.sh failed"; exit 91; }
+          lunch "$UA_LUNCH" || { echo "lunch $UA_LUNCH failed"; exit 92; }
+          [ -n "$TARGET_PRODUCT" ] || { echo "lunch did not set TARGET_PRODUCT"; exit 93; }
+          echo "=== make -j$UA_JOBS otapackage  $(date '+%F %T') ==="
+          make -j"$UA_JOBS" otapackage; rc=$?
+          echo "=== make finished rc=$rc  $(date '+%F %T') ==="
+          prebuilts/misc/linux-x86/ccache/ccache -s
+          exit $rc
+          EOF
+          docker rm -f ua-build >/dev/null 2>&1 || true
+          JOBS=$(( $(nproc) + 1 ))
+          # Leave ~15 min of the 6 h job limit for saving ccache + uploading, so those steps still get to run.
+          limit=$(( 345 * 60 - ($(date +%s) - JOB_START) ))
+          echo "Time left for the build: $((limit / 60)) min (make -j$JOBS)"
+          if [ "$limit" -lt 600 ]; then echo "::error::less than 10 minutes left for the build"; exit 1; fi
+          # (the sleep must not inherit the step's stdout, or an orphaned sleep could keep the step "running" after the build ends)
+          ( while sleep 300 >/dev/null 2>&1; do echo "[heartbeat] $(date '+%F %T') $(free -m | awk '/Mem:/{print "mem_avail=" $7 "MB"}') $(df -h /ua | awk 'NR==2{print "disk_free=" $4}') load=$(cut -d' ' -f1 /proc/loadavg)"; done ) &
+          hb=$!
+          set +e
+          timeout -k 60 "$limit" docker run --rm --name ua-build --network=host \
+            -v /ua/src:/src -v /ua/ccache:/ccache -v /ua/home:/ua-home -v /ua/tmp:/tmp \
+            -v /ua/in-container.sh:/ua/in-container.sh:ro \
+            -e HOME=/ua-home -e UA_LUNCH="$UA_LUNCH" -e UA_JOBS="$JOBS" \
+            ua-aosp60:bionic bash /ua/in-container.sh 2>&1 | tee /ua/logs/build.log
+          rc=${PIPESTATUS[0]}
+          kill "$hb" 2>/dev/null
+          if [ "$rc" -eq 124 ]; then echo "::warning::Stopped at the time limit. Run the workflow again: the saved ccache makes the next pass much faster."; fi
+          exit "$rc"
+
+      - name: Stop container and fix file ownership
+        id: post
+        if: ${{ always() }}
+        run: |
+          docker rm -f ua-build >/dev/null 2>&1 || true
+          sudo chown -R "$USER":"$(id -gn)" /ua/ccache /ua/logs /ua/dist 2>/dev/null || true
+          if [ -n "$(ls -A /ua/ccache 2>/dev/null)" ]; then echo "has_ccache=true" >> "$GITHUB_OUTPUT"; fi
+          du -sh /ua/ccache 2>/dev/null || true
+          df -h /ua
+
+      - name: Save ccache
+        if: ${{ always() && steps.post.outputs.has_ccache == 'true' && steps.ccache.outcome == 'success' }}
+        uses: actions/cache/save@v6
+        with:
+          path: /ua/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Collect result
+        id: collect
+        if: ${{ steps.build.outcome == 'success' }}
+        env:
+          ARTIFACT_PASSPHRASE: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          out=/ua/src/out/target/product/$UA_DEVICE
+          z=$(find "$out" -maxdepth 1 -type f -name "ua_${UA_DEVICE}-[0-9]*.zip" -printf '%T@ %p\n' | sort -nr | sed -n 1p | cut -d' ' -f2-)
+          [ -n "$z" ] || z=$(find "$out" -maxdepth 1 -type f -name '*-ota-*.zip' -printf '%T@ %p\n' | sort -nr | sed -n 1p | cut -d' ' -f2-)
+          [ -n "$z" ] || { echo "::error::no OTA zip found in $out"; exit 1; }
+          unzip -tq "$z"
+          n=$(basename "$z")
+          cp "$z" "/ua/dist/$n"
+          cd /ua/dist
+          md5sum "$n" | tee "$n.md5"
+          sha256sum "$n" | tee "$n.sha256"
+          size=$(du -h "$n" | cut -f1)
+          if [ -n "${ARTIFACT_PASSPHRASE:-}" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$n" -out "$n.enc" -pass env:ARTIFACT_PASSPHRASE
+            rm -f "$n"
+            echo "file=$n.enc" >> "$GITHUB_OUTPUT"
+            how="Encrypted with your ARTIFACT_PASSPHRASE. Decrypt: openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $n.enc -out $n"
+          else
+            echo "file=$n" >> "$GITHUB_OUTPUT"
+            how="NOT encrypted (no ARTIFACT_PASSPHRASE secret set). In a public repo anyone logged in to GitHub can download it."
+          fi
+          {
+            echo "### Build finished: \`$n\` ($size)"
+            echo ""
+            echo "- md5: \`$(cut -d' ' -f1 "$n.md5")\`"
+            echo "- sha256: \`$(cut -d' ' -f1 "$n.sha256")\`"
+            echo "- $how"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ROM zip
+        if: ${{ steps.collect.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: /ua/dist/${{ steps.collect.outputs.file }}
+          archive: false
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload checksums
+        if: ${{ steps.collect.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: checksums
+          path: |
+            /ua/dist/*.md5
+            /ua/dist/*.sha256
+          retention-days: 14
+
+      - name: Compress build log
+        if: ${{ always() }}
+        run: gzip -9 -f /ua/logs/build.log || true
+
+      - name: Upload build log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: /ua/logs/build.log.gz
+          if-no-files-found: ignore
+          retention-days: 14
