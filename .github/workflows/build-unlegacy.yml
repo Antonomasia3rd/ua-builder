@@ -3,8 +3,14 @@ name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
 # Manual only: Actions tab -> "Build Unlegacy-Android 6.0 (Galaxy Tab 2)" -> Run workflow.
 # Needs a PUBLIC repository: only public repos get the 4 vCPU / 16 GB runner; private ones get 2 vCPU / 8 GB,
 # which will not finish inside GitHub's 6-hour job limit (see UA-ACTIONS-README.md).
-# History: run #1 synced, built the image and compiled for ~1 h, then died at jack.jar: Docker does not set $USER and
-# Android 6.0's jack/jack-admin scripts use 'set -o nounset'. Fixed below (USER export, ccache compiler check, early Jack check).
+# History:
+#  run #1: synced, built the image, compiled ~1 h, died at jack.jar: Docker does not set $USER and Android 6.0's
+#          jack/jack-admin use 'set -o nounset'. Fixed: USER is exported in the container.
+#  run #2: Jack worked (222 compilations, 0 failures) and the build reached ~98 %, but one module failed: JDK 8's javac
+#          (stricter than JDK 7's about missing superinterfaces) rejects frameworks/support/v4 against the API-4 SDK jar
+#          ("cannot access RemoteControlClient"). Android 6.0 is meant to be built with OpenJDK 7, so the image now has
+#          JDK 7 (Azul Zulu 7 = OpenJDK 7u352). Also: the ccache save failed with "No space left on device" because the
+#          disk-merge step left only ~0.5 GB free on / (see the reserves below).
 on:
   workflow_dispatch:
     inputs:
@@ -56,12 +62,15 @@ jobs:
           df -h /
 
       # Pinned to a commit (master as of 2025-03-28). Merges the free space of / and /mnt into one volume at /ua.
+      # On today's ubuntu-24.04 runners /mnt is NOT a separate disk: both loop files are carved out of the root filesystem, so
+      # what is left free on / afterwards is only temp-reserve-mb (run #2 had 512 MB, and the 1.6 GB ccache archive, which
+      # actions/cache writes to / as the runner user, did not fit). Keep ~10 GB free on / (root-reserve must stay above temp-reserve).
       - name: Merge free disk space into one big volume at /ua
         uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
         with:
           build-mount-path: /ua
-          root-reserve-mb: 8192
-          temp-reserve-mb: 512
+          root-reserve-mb: 14336
+          temp-reserve-mb: 10240
           swap-size-mb: 2048
           remove-dotnet: 'true'
           remove-android: 'true'
@@ -80,6 +89,9 @@ jobs:
           echo "Free space on /ua: ${avail} GB"
           if [ "$avail" -lt 30 ]; then echo "::error::Only ${avail} GB free on /ua; the build needs roughly 45 GB."; exit 1; fi
           if [ "$avail" -lt 45 ]; then echo "::warning::Only ${avail} GB free on /ua - tight. Watch the disk_free heartbeat lines in the build step."; fi
+          rootavail=$(df -BG --output=avail / | tail -n1 | tr -dc 0-9)
+          echo "Free space on / (docker images and the ccache archive live here): ${rootavail} GB"
+          if [ "$rootavail" -lt 6 ]; then echo "::warning::Only ${rootavail} GB free on / - saving/restoring the ccache archive (~1.6 GB) may fail."; fi
 
       - name: Build the Ubuntu 18.04 build image
         run: |
@@ -87,20 +99,29 @@ jobs:
           cat > Dockerfile <<'EOF'
           ARG BASE=docker.io/library/ubuntu:18.04
           FROM ${BASE}
-          ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+          ARG JDK7_URL=https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz
+          ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C JAVA_HOME=/usr/lib/jvm/zulu7 PATH=/usr/lib/jvm/zulu7/bin:${PATH}
           RUN (apt-get update || (sed -i -E 's#https?://[a-z.]*ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' /etc/apt/sources.list && apt-get update)) \
-           && apt-get install -y --no-install-recommends openjdk-8-jdk python git curl ca-certificates ccache flex bison gperf build-essential zip unzip zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev libncurses5 libtinfo5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc bc lzop libssl-dev file rsync procps less xz-utils gawk patch perl \
-           && (update-java-alternatives -s java-1.8.0-openjdk-amd64 || true) \
+           && apt-get install -y --no-install-recommends python git curl ca-certificates ccache flex bison gperf build-essential zip unzip zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev libncurses5 libtinfo5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc bc lzop libssl-dev file rsync procps less xz-utils gawk patch perl \
            && apt-get clean && rm -rf /var/lib/apt/lists/*
+          # JDK 7 on purpose: Android 6.0 is built and tested by Google with OpenJDK 7. JDK 8's javac fails on frameworks/support/v4
+          # ("cannot access RemoteControlClient"). Ubuntu removed openjdk-7 from its archive, so use Azul Zulu 7 (an OpenJDK 7 build).
+          RUN mkdir -p /usr/lib/jvm/zulu7 \
+           && curl -fsSL --retry 6 --retry-delay 10 --retry-connrefused -o /tmp/jdk7.tar.gz "${JDK7_URL}" \
+           && sha256sum /tmp/jdk7.tar.gz \
+           && tar -xzf /tmp/jdk7.tar.gz -C /usr/lib/jvm/zulu7 --strip-components=1 \
+           && rm -f /tmp/jdk7.tar.gz \
+           && javac -version && test -f /usr/lib/jvm/zulu7/lib/tools.jar
           EOF
           ok=0
           for base in docker.io/library/ubuntu:18.04 mirror.gcr.io/library/ubuntu:18.04; do
             if docker build --build-arg "BASE=$base" -t ua-aosp60:bionic .; then ok=1; break; fi
             echo "::warning::image build failed on $base"
           done
-          [ "$ok" = 1 ] || { echo "::error::could not build the Ubuntu 18.04 image"; exit 1; }
-          docker run --rm ua-aosp60:bionic bash -c 'javac -version 2>&1; python --version 2>&1; make --version | head -n1'
-          docker run --rm ua-aosp60:bionic bash -c 'javac -version 2>&1 | grep -q "1\.8" && python --version 2>&1 | grep -q "2\.7"'
+          [ "$ok" = 1 ] || { echo "::error::could not build the build image (see the docker output above; the JDK 7 download from cdn.azul.com is the usual suspect)"; exit 1; }
+          docker run --rm ua-aosp60:bionic bash -c 'java -version 2>&1; javac -version 2>&1; echo "JAVA_HOME=$JAVA_HOME"; python --version 2>&1; make --version | head -n1'
+          docker run --rm ua-aosp60:bionic bash -c 'java -version 2>&1 | grep -q "1\.7\." && javac -version 2>&1 | grep -q "1\.7\." && python --version 2>&1 | grep -q "2\.7"' \
+            || { echo "::error::the build image does not have Java 1.7 and Python 2.7 as expected"; exit 1; }
 
       - name: Install repo and a git identity
         run: |
@@ -156,29 +177,17 @@ jobs:
           # ccache's default (mtime) every cached object would miss. Hashing the compiler binary keeps the cache valid.
           export LC_ALL=C USE_CCACHE=1 CCACHE_DIR=/ccache CCACHE_COMPRESS=1 CCACHE_COMPILERCHECK=content
           cd /src || exit 90
-          echo "container: $(javac -version 2>&1) | $(python --version 2>&1) | $(make --version | head -n1) | nproc=$(nproc) | USER=$USER HOME=$HOME"
+          echo "container: $(javac -version 2>&1) | $(java -version 2>&1 | sed -n 1p) | $(python --version 2>&1) | $(make --version | head -n1) | nproc=$(nproc) | USER=$USER HOME=$HOME JAVA_HOME=$JAVA_HOME"
           prebuilts/misc/linux-x86/ccache/ccache -M 6G || echo "ccache -M failed (continuing)"
           . build/envsetup.sh || { echo "envsetup.sh failed"; exit 91; }
           lunch "$UA_LUNCH" || { echo "lunch $UA_LUNCH failed"; exit 92; }
           [ -n "$TARGET_PRODUCT" ] || { echo "lunch did not set TARGET_PRODUCT"; exit 93; }
-          finish() { echo "=== finished rc=$1  $(date '+%F %T') ==="; prebuilts/misc/linux-x86/ccache/ccache -s; exit "$1"; }
-          # Early check (minutes): build the first Java library. That installs and starts the Jack server, so a Jack problem
-          # shows up now instead of an hour into the full build. Nothing is wasted: the full build below reuses this work.
-          echo "=== early Jack check: make core-libart  $(date '+%F %T') ==="
-          make -j"$UA_JOBS" core-libart 2>&1 | tee /tmp/ua-early-check.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            if grep -q "No rule to make target .core-libart.\.  *Stop" /tmp/ua-early-check.log; then
-              echo "NOTE: this tree has no 'core-libart' module; skipping the early Jack check."
-            else
-              echo "=== early Jack check FAILED (rc=$rc): stopping now instead of failing an hour into the full build ==="
-              finish 94
-            fi
-          fi
           # -k: keep going after an error, so one run reports every failing module instead of only the first one.
           echo "=== make -k -j$UA_JOBS otapackage  $(date '+%F %T') ==="
           make -k -j"$UA_JOBS" otapackage; rc=$?
-          finish "$rc"
+          echo "=== finished rc=$rc  $(date '+%F %T') ==="
+          prebuilts/misc/linux-x86/ccache/ccache -s
+          exit $rc
           EOF
           docker rm -f ua-build >/dev/null 2>&1 || true
           JOBS=$(( $(nproc) + 1 ))
@@ -199,9 +208,22 @@ jobs:
           kill "$hb" 2>/dev/null
           if [ "$rc" -eq 124 ]; then echo "::warning::Stopped at the time limit. Run the workflow again: the saved ccache makes the next pass much faster."; fi
           case "$rc" in
-            94) echo "::error::The early Jack check failed, so the full build was not started. See the log above and the build-log artifact." ;;
             90|91|92|93) echo "::error::Setting up the build inside the container failed (exit $rc: 90 no /src, 91 envsetup.sh, 92 lunch, 93 no TARGET_PRODUCT)." ;;
           esac
+          if [ "$rc" -ne 0 ] && [ -s /ua/logs/build.log ]; then
+            # Short failure report on the run's summary page, so the cause can be read (or pasted) without opening the 4 MB log.
+            {
+              echo "### Build step failed (exit $rc)"
+              echo "Failing make targets (with -k every independent target is still built, so this lists them all):"
+              echo '```'
+              grep -E '^make: \*\*\* \[' /ua/logs/build.log | head -n 15 | cut -c1-300
+              echo '```'
+              echo "First compiler errors:"
+              echo '```'
+              grep -n -A2 -P ': error:|^ERROR: (?!No Jack server)' /ua/logs/build.log | head -n 30 | cut -c1-300
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY" || true
+          fi
           exit "$rc"
 
       - name: Stop container and fix file ownership
@@ -215,7 +237,7 @@ jobs:
           ls -la /ua/logs || true
           if [ -n "$(ls -A /ua/ccache 2>/dev/null)" ]; then echo "has_ccache=true" >> "$GITHUB_OUTPUT"; fi
           du -sh /ua/ccache 2>/dev/null || true
-          df -h /ua
+          df -h / /ua
 
       - name: Save ccache
         if: ${{ always() && steps.post.outputs.has_ccache == 'true' && steps.ccache.outcome == 'success' }}
