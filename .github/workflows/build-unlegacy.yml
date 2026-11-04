@@ -2,7 +2,9 @@ name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
 
 # Manual only: Actions tab -> "Build Unlegacy-Android 6.0 (Galaxy Tab 2)" -> Run workflow.
 # Needs a PUBLIC repository: only public repos get the 4 vCPU / 16 GB runner; private ones get 2 vCPU / 8 GB,
-# which will not finish inside GitHub's 6-hour job limit. Not run end-to-end yet (see UA-ACTIONS-README.md).
+# which will not finish inside GitHub's 6-hour job limit (see UA-ACTIONS-README.md).
+# History: run #1 synced, built the image and compiled for ~1 h, then died at jack.jar: Docker does not set $USER and
+# Android 6.0's jack/jack-admin scripts use 'set -o nounset'. Fixed below (USER export, ccache compiler check, early Jack check).
 on:
   workflow_dispatch:
     inputs:
@@ -133,11 +135,12 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /ua/ccache
-          key: ccache-${{ inputs.device }}-${{ inputs.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # "v2": the run #1 cache was keyed on the compilers' mtimes, which change on every fresh sync, so it can never hit again.
+          key: ccache-v2-${{ inputs.device }}-${{ inputs.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-${{ inputs.device }}-${{ inputs.variant }}-
-            ccache-${{ inputs.device }}-
-            ccache-
+            ccache-v2-${{ inputs.device }}-${{ inputs.variant }}-
+            ccache-v2-${{ inputs.device }}-
+            ccache-v2-
 
       - name: Build (make otapackage inside the Ubuntu 18.04 container)
         id: build
@@ -146,18 +149,36 @@ jobs:
           cat > /ua/in-container.sh <<'EOF'
           set +eu
           ulimit -n "$(ulimit -Hn)" 2>/dev/null
-          export LC_ALL=C USE_CCACHE=1 CCACHE_DIR=/ccache CCACHE_COMPRESS=1
+          # Docker does not set USER/LOGNAME, but Android 6.0's jack and jack-admin run with 'set -o nounset' and build
+          # "$TMPDIR/jack-$USER"; without USER they die with "USER: unbound variable" (that is what ended run #1).
+          export USER=${USER:-root} LOGNAME=${LOGNAME:-root}
+          # compiler_check=content: every run starts from a fresh checkout, so the compilers get new mtimes, and with
+          # ccache's default (mtime) every cached object would miss. Hashing the compiler binary keeps the cache valid.
+          export LC_ALL=C USE_CCACHE=1 CCACHE_DIR=/ccache CCACHE_COMPRESS=1 CCACHE_COMPILERCHECK=content
           cd /src || exit 90
-          echo "container: $(javac -version 2>&1) | $(python --version 2>&1) | $(make --version | head -n1) | nproc=$(nproc)"
+          echo "container: $(javac -version 2>&1) | $(python --version 2>&1) | $(make --version | head -n1) | nproc=$(nproc) | USER=$USER HOME=$HOME"
           prebuilts/misc/linux-x86/ccache/ccache -M 6G || echo "ccache -M failed (continuing)"
           . build/envsetup.sh || { echo "envsetup.sh failed"; exit 91; }
           lunch "$UA_LUNCH" || { echo "lunch $UA_LUNCH failed"; exit 92; }
           [ -n "$TARGET_PRODUCT" ] || { echo "lunch did not set TARGET_PRODUCT"; exit 93; }
-          echo "=== make -j$UA_JOBS otapackage  $(date '+%F %T') ==="
-          make -j"$UA_JOBS" otapackage; rc=$?
-          echo "=== make finished rc=$rc  $(date '+%F %T') ==="
-          prebuilts/misc/linux-x86/ccache/ccache -s
-          exit $rc
+          finish() { echo "=== finished rc=$1  $(date '+%F %T') ==="; prebuilts/misc/linux-x86/ccache/ccache -s; exit "$1"; }
+          # Early check (minutes): build the first Java library. That installs and starts the Jack server, so a Jack problem
+          # shows up now instead of an hour into the full build. Nothing is wasted: the full build below reuses this work.
+          echo "=== early Jack check: make core-libart  $(date '+%F %T') ==="
+          make -j"$UA_JOBS" core-libart 2>&1 | tee /tmp/ua-early-check.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            if grep -q "No rule to make target .core-libart.\.  *Stop" /tmp/ua-early-check.log; then
+              echo "NOTE: this tree has no 'core-libart' module; skipping the early Jack check."
+            else
+              echo "=== early Jack check FAILED (rc=$rc): stopping now instead of failing an hour into the full build ==="
+              finish 94
+            fi
+          fi
+          # -k: keep going after an error, so one run reports every failing module instead of only the first one.
+          echo "=== make -k -j$UA_JOBS otapackage  $(date '+%F %T') ==="
+          make -k -j"$UA_JOBS" otapackage; rc=$?
+          finish "$rc"
           EOF
           docker rm -f ua-build >/dev/null 2>&1 || true
           JOBS=$(( $(nproc) + 1 ))
@@ -172,11 +193,15 @@ jobs:
           timeout -k 60 "$limit" docker run --rm --name ua-build --network=host \
             -v /ua/src:/src -v /ua/ccache:/ccache -v /ua/home:/ua-home -v /ua/tmp:/tmp \
             -v /ua/in-container.sh:/ua/in-container.sh:ro \
-            -e HOME=/ua-home -e UA_LUNCH="$UA_LUNCH" -e UA_JOBS="$JOBS" \
+            -e HOME=/ua-home -e USER=root -e LOGNAME=root -e UA_LUNCH="$UA_LUNCH" -e UA_JOBS="$JOBS" \
             ua-aosp60:bionic bash /ua/in-container.sh 2>&1 | tee /ua/logs/build.log
           rc=${PIPESTATUS[0]}
           kill "$hb" 2>/dev/null
           if [ "$rc" -eq 124 ]; then echo "::warning::Stopped at the time limit. Run the workflow again: the saved ccache makes the next pass much faster."; fi
+          case "$rc" in
+            94) echo "::error::The early Jack check failed, so the full build was not started. See the log above and the build-log artifact." ;;
+            90|91|92|93) echo "::error::Setting up the build inside the container failed (exit $rc: 90 no /src, 91 envsetup.sh, 92 lunch, 93 no TARGET_PRODUCT)." ;;
+          esac
           exit "$rc"
 
       - name: Stop container and fix file ownership
@@ -184,7 +209,10 @@ jobs:
         if: ${{ always() }}
         run: |
           docker rm -f ua-build >/dev/null 2>&1 || true
+          # Jack server log (where Jack out-of-memory / crash messages end up); /ua/tmp is the container's /tmp.
+          sudo find /ua/tmp -maxdepth 2 -type f -name 'jack-*.log' -exec cp -f {} /ua/logs/ \; 2>/dev/null || true
           sudo chown -R "$USER":"$(id -gn)" /ua/ccache /ua/logs /ua/dist 2>/dev/null || true
+          ls -la /ua/logs || true
           if [ -n "$(ls -A /ua/ccache 2>/dev/null)" ]; then echo "has_ccache=true" >> "$GITHUB_OUTPUT"; fi
           du -sh /ua/ccache 2>/dev/null || true
           df -h /ua
@@ -231,11 +259,25 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ROM zip
+        id: upload_rom
         if: ${{ steps.collect.outcome == 'success' }}
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           path: /ua/dist/${{ steps.collect.outputs.file }}
           archive: false
+          retention-days: 14
+          if-no-files-found: error
+
+      # Safety net: if the direct upload above is rejected, the ROM is uploaded again the classic (zipped) way,
+      # because the runner is thrown away after this job and a finished build must not be lost on the last step.
+      - name: Upload ROM zip (fallback)
+        if: ${{ always() && steps.collect.outcome == 'success' && steps.upload_rom.outcome != 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: rom
+          path: /ua/dist/${{ steps.collect.outputs.file }}
+          compression-level: 0
           retention-days: 14
           if-no-files-found: error
 
@@ -251,13 +293,13 @@ jobs:
 
       - name: Compress build log
         if: ${{ always() }}
-        run: gzip -9 -f /ua/logs/build.log || true
+        run: gzip -9 -f /ua/logs/*.log || true
 
       - name: Upload build log
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: build-log
-          path: /ua/logs/build.log.gz
+          path: /ua/logs/*.log.gz
           if-no-files-found: ignore
           retention-days: 14
