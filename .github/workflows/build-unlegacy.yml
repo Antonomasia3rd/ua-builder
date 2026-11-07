@@ -11,6 +11,9 @@ name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
 #          ("cannot access RemoteControlClient"). Android 6.0 is meant to be built with OpenJDK 7, so the image now has
 #          JDK 7 (Azul Zulu 7 = OpenJDK 7u352). Also: the ccache save failed with "No space left on device" because the
 #          disk-merge step left only ~0.5 GB free on / (see the reserves below).
+#  run #3: succeeded (ua_espresso3g-6.0.1-20261105.zip, flashed and boots). On the 7-inch Tab 2 it came up in landscape, because
+#          the Unlegacy tree lacks the rotation setup that LineageOS has. The portrait_7in option below adds it (it is on by default;
+#          untick it for the 10.1-inch models, or to build exactly like run #3).
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +27,10 @@ on:
         type: choice
         options: [user, userdebug]
         default: user
+      portrait_7in:
+        description: "7-inch Tab 2 (P3100/P3110): boot in portrait like LineageOS does. Untick for the 10.1-inch models, or to build exactly like run #3"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -41,6 +48,7 @@ env:
   UA_LUNCH: ua_${{ inputs.device }}-${{ inputs.variant }}
   UA_BRANCH: aosp-6.0
   UA_MANIFEST: https://github.com/Unlegacy-Android/android.git
+  UA_PORTRAIT: ${{ inputs.portrait_7in }}
 
 jobs:
   build:
@@ -150,6 +158,164 @@ jobs:
             [ -e "$f" ] || { echo "::error::$f is missing after sync"; exit 1; }
           done
           df -h /ua
+
+      # The 7-inch Tab 2 has a landscape panel that stock firmware and LineageOS run rotated (ro.sf.hwrotation=270) so that the tablet is a
+      # portrait device, and they turn the touchscreen and sensor axes along with it (LineageOS: init.espresso.variant.sh). The Unlegacy tree
+      # has nothing like it, so run #3 booted in landscape. This step adds the same three things; the script's header explains each one.
+      # It stops with an error if the Unlegacy tree no longer looks the way the script expects, so a build never gets half a patch.
+      - name: Apply the 7-inch portrait fix (portrait_7in)
+        if: ${{ inputs.portrait_7in }}
+        run: |
+          cat > /ua/apply-portrait-7in.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # Makes the 7-inch Galaxy Tab 2 (P3100/P3110) boot in portrait, the way LineageOS does.
+          # Usage: apply-portrait-7in.py <root of the Android source tree>
+          #
+          # The 7" Tab 2 has a 1024x600 panel that is mounted turned by 90 degrees. Stock firmware and LineageOS run it
+          # rotated (ro.sf.hwrotation=270) so that the tablet is a portrait device, and turn the touchscreen and the
+          # accelerometer/compass axes with it. LineageOS does that from init.espresso.variant.sh; the Unlegacy tree
+          # has no equivalent, which is why it boots in landscape. This script adds the same three things:
+          #   1. device-common.mk:           ro.sf.hwrotation=270 (goes into /system/build.prop, read before SurfaceFlinger starts)
+          #   2. rootdir/init.espresso.rc:   "on property:ro.sf.hwrotation=270" -> touchscreen pivot = 1 (init writes it)
+          #   3. libsensors/SensorBase.cpp:  if ro.sf.hwrotation is 270, the accelerometer and the magnetometer get position = 6
+          #      rootdir/init.espresso.sensors.rc: also gives group "input" the position files of input1 and input2
+          # Everything except (1) does nothing unless ro.sf.hwrotation is 270. Safe to run twice; stops with an error if the
+          # expected text is not where it should be (so a changed Unlegacy tree never gets half a patch).
+          import os
+          import sys
+
+          ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
+          DEV = "device/samsung/espresso"
+
+
+          def fail(msg):
+              print("::error::portrait fix: " + msg)
+              sys.exit(1)
+
+
+          def replace_once(text, old, new, what):
+              n = text.count(old)
+              if n != 1:
+                  fail("expected text found %d times (need exactly 1) in %s; the Unlegacy tree has changed:\n%s" % (n, what, old))
+              return text.replace(old, new, 1)
+
+
+          def edit(rel, marker, change):
+              path = os.path.join(ROOT, DEV, rel)
+              if not os.path.isfile(path):
+                  fail(DEV + "/" + rel + " does not exist")
+              with open(path, encoding="utf-8", newline="") as f:
+                  text = f.read()
+              if marker in text:
+                  print("  already patched: " + rel)
+                  return
+              new = change(text, DEV + "/" + rel)
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  f.write(new)
+              print("  patched: " + rel)
+
+
+          # ---- 1. the property -------------------------------------------------------------------------------------------
+          PROP_OLD = "    ro.opengles.version=131072 \\\n    ro.sf.lcd_density=160\n"
+          PROP_NEW = PROP_OLD + (
+              "\n"
+              "# 7\" Tab 2 (P3100/P3110): the panel is mounted rotated, so run it in portrait like the stock firmware and\n"
+              "# LineageOS do. init.espresso.rc and the sensors HAL turn the touchscreen and sensor axes when they see this.\n"
+              "PRODUCT_PROPERTY_OVERRIDES += \\\n"
+              "    ro.sf.hwrotation=270\n")
+          edit("device-common.mk", "ro.sf.hwrotation", lambda t, w: replace_once(t, PROP_OLD, PROP_NEW, w))
+
+          # ---- 2. touchscreen axes (init writes the sysfs file) --------------------------------------------------------------
+          RC_ADD = (
+              "\n"
+              "# 7\" Tab 2: the panel is mounted rotated (ro.sf.hwrotation=270, see device-common.mk), so turn the\n"
+              "# touchscreen axes with it. LineageOS does this from init.espresso.variant.sh.\n"
+              "on property:ro.sf.hwrotation=270\n"
+              "    write /sys/devices/virtual/sec/tsp/pivot 1\n")
+          edit("rootdir/init.espresso.rc", "on property:ro.sf.hwrotation=270",
+               lambda t, w: (t if t.endswith("\n") else t + "\n") + RC_ADD)
+
+          # ---- 3. sensor axes (sensors HAL writes the sysfs files) ------------------------------------------------------------
+          CHOWN_OLD = "    chown system input /sys/class/input/input3/position\n"
+          CHOWN_NEW = ("    chown system input /sys/class/input/input1/position\n"
+                       "    chown system input /sys/class/input/input2/position\n") + CHOWN_OLD
+          edit("rootdir/init.espresso.sensors.rc", "input2/position",
+               lambda t, w: replace_once(t, CHOWN_OLD, CHOWN_NEW, w))
+
+          INC_LOG_OLD = "#include <cutils/log.h>\n"
+          INC_LOG_NEW = INC_LOG_OLD + "#include <cutils/properties.h>\n"
+          INC_STR_OLD = "#include <cstring>\n"
+          INC_STR_NEW = INC_STR_OLD + "#include <stdio.h>\n#include <stdlib.h>\n"
+
+          CTOR_OLD = (
+              "SensorBase::SensorBase(\n"
+              "        const char* dev_name,\n"
+              "        const char* data_name)\n"
+              "    : dev_name(dev_name), data_name(data_name),\n"
+              "      dev_fd(-1), data_fd(-1)\n"
+              "{\n"
+              "    if (data_name) {\n"
+              "        data_fd = openInput(data_name);\n"
+              "    }\n"
+              "}\n")
+          CTOR_NEW = (
+              "/*\n"
+              " * 7\" Tab 2 (P3100/P3110): the landscape panel is run rotated by 270 degrees (ro.sf.hwrotation, set in\n"
+              " * device-common.mk) so that the tablet is a portrait device. The accelerometer and the magnetometer are not\n"
+              " * turned with it, so tell their kernel drivers to remap the axes: position 6 is the value that the Replicant\n"
+              " * and LineageOS variant script writes for these tablets. Does nothing on a panel that is not rotated.\n"
+              " */\n"
+              "static void applyPanelPosition(const char* sensorName, const char* eventName)\n"
+              "{\n"
+              "    char prop[PROPERTY_VALUE_MAX];\n"
+              "    char path[PATH_MAX];\n"
+              "    int fd;\n"
+              "\n"
+              "    if (strcmp(sensorName, \"accelerometer\") != 0 &&\n"
+              "            strcmp(sensorName, \"geomagnetic\") != 0)\n"
+              "        return;\n"
+              "    if (property_get(\"ro.sf.hwrotation\", prop, \"0\") <= 0 || atoi(prop) != 270)\n"
+              "        return;\n"
+              "\n"
+              "    snprintf(path, sizeof(path), \"/sys/class/input/%s/device/position\", eventName);\n"
+              "    fd = open(path, O_WRONLY);\n"
+              "    if (fd < 0) {\n"
+              "        ALOGE(\"%s: cannot open %s (%s)\", sensorName, path, strerror(errno));\n"
+              "        return;\n"
+              "    }\n"
+              "    if (write(fd, \"6\", 1) != 1)\n"
+              "        ALOGE(\"%s: cannot write %s (%s)\", sensorName, path, strerror(errno));\n"
+              "    else\n"
+              "        ALOGI(\"%s: panel is rotated, set %s to 6\", sensorName, path);\n"
+              "    close(fd);\n"
+              "}\n"
+              "\n"
+              "SensorBase::SensorBase(\n"
+              "        const char* dev_name,\n"
+              "        const char* data_name)\n"
+              "    : dev_name(dev_name), data_name(data_name),\n"
+              "      dev_fd(-1), data_fd(-1)\n"
+              "{\n"
+              "    if (data_name) {\n"
+              "        data_fd = openInput(data_name);\n"
+              "        if (data_fd >= 0)\n"
+              "            applyPanelPosition(data_name, input_name);\n"
+              "    }\n"
+              "}\n")
+
+
+          def sensorbase(text, what):
+              text = replace_once(text, INC_LOG_OLD, INC_LOG_NEW, what)
+              text = replace_once(text, INC_STR_OLD, INC_STR_NEW, what)
+              return replace_once(text, CTOR_OLD, CTOR_NEW, what)
+
+
+          edit("libsensors/SensorBase.cpp", "applyPanelPosition", sensorbase)
+
+          print("portrait fix: done (7-inch Tab 2 will boot in portrait)")
+          PYEOF
+          python3 /ua/apply-portrait-7in.py /ua/src
+          git -C /ua/src/device/samsung/espresso diff --stat
 
       - name: Restore ccache
         id: ccache
@@ -263,6 +429,17 @@ jobs:
           md5sum "$n" | tee "$n.md5"
           sha256sum "$n" | tee "$n.sha256"
           size=$(du -h "$n" | cut -f1)
+          portrait="portrait fix: not applied (portrait_7in was off)"
+          if [ "$UA_PORTRAIT" = "true" ]; then
+            if grep -q '^ro.sf.hwrotation=270$' "$out/system/build.prop" 2>/dev/null \
+               && grep -q '^on property:ro.sf.hwrotation=270$' "$out/root/init.espresso.rc" 2>/dev/null \
+               && grep -qa 'ro.sf.hwrotation' "$out/system/lib/hw/sensors.omap4.so" 2>/dev/null; then
+              portrait="portrait fix: found in the finished image (ro.sf.hwrotation=270 in build.prop, touchscreen rule in init.espresso.rc, sensors library)"
+            else
+              portrait="portrait fix: applied to the source, but NOT everything was found in the finished image - check the log"
+              echo "::warning::portrait fix: not everything was found in the finished image"
+            fi
+          fi
           if [ -n "${ARTIFACT_PASSPHRASE:-}" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$n" -out "$n.enc" -pass env:ARTIFACT_PASSPHRASE
             rm -f "$n"
@@ -278,6 +455,7 @@ jobs:
             echo "- md5: \`$(cut -d' ' -f1 "$n.md5")\`"
             echo "- sha256: \`$(cut -d' ' -f1 "$n.sha256")\`"
             echo "- $how"
+            echo "- $portrait"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ROM zip
