@@ -15,8 +15,16 @@ name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
 #          the Unlegacy tree lacks the rotation setup that LineageOS has.
 #  portrait_7in, first version: added ro.sf.hwrotation=270 plus the touchscreen and sensor axes. The screen STAYED landscape and only the
 #          touchscreen turned, because Android 6.0.1's SurfaceFlinger ignores ro.sf.hwrotation (LineageOS 13 carries its own patch
-#          for it). The portrait_7in step below now also adds that SurfaceFlinger patch (and LineageOS' screenshot and
-#          rotation-animation hooks). It is on by default; untick it for the 10.1-inch models, or to build exactly like run #3.
+#          for it).
+#  portrait_7in, second version: added that SurfaceFlinger patch (and LineageOS' screenshot and rotation-animation hooks). Built, flashed,
+#          boots in portrait. Reported on it: (a) the screen-off animation shows the last frame turned 90 degrees counter-clockwise and
+#          squeezed; (b) at a screen rotation the new content shows for a split second before the rotation animation plays; (c) the
+#          launcher is still the Android 4 style Launcher2; (d) the notification shade is see-through (not in screenshots; "Show CPU
+#          usage" hides it).
+#  this version: (a) is fixed inside the portrait_7in step (ColorFade turns its screenshot back; checked with a pixel simulation);
+#          (c) is the new launcher3 option; (b) and maybe (d) are the target of the new gpu_composition option: SurfaceFlinger composes every
+#          layer with the GPU from boot on, like Developer options -> "Disable HW overlays" (a best guess, not proven).
+#          All three are on by default; untick portrait_7in for the 10.1-inch models, or any of them to build without it.
 on:
   workflow_dispatch:
     inputs:
@@ -31,7 +39,15 @@ on:
         options: [user, userdebug]
         default: user
       portrait_7in:
-        description: "7-inch Tab 2 (P3100/P3110): boot in portrait like LineageOS does (patches SurfaceFlinger, touchscreen, sensors). Untick for the 10.1-inch models (P5100/P5110), or to build exactly like run #3"
+        description: "7-inch Tab 2 (P3100/P3110): boot in portrait like LineageOS does (patches SurfaceFlinger, touchscreen, sensors, the screen-off animation). Untick for the 10.1-inch models (P5100/P5110), or to build exactly like run #3"
+        type: boolean
+        default: true
+      launcher3:
+        description: "Home screen: AOSP's Android 6 launcher (Launcher3) instead of the Android 4 style Launcher2 that Unlegacy ships"
+        type: boolean
+        default: true
+      gpu_composition:
+        description: "Compose the whole screen with the GPU, none with hardware overlays (like Developer options -> Disable HW overlays, but from boot on). Aimed at the see-through notification shade and the flash before the rotation animation; a best guess. Untick to build without it"
         type: boolean
         default: true
 
@@ -52,6 +68,8 @@ env:
   UA_BRANCH: aosp-6.0
   UA_MANIFEST: https://github.com/Unlegacy-Android/android.git
   UA_PORTRAIT: ${{ inputs.portrait_7in }}
+  UA_LAUNCHER3: ${{ inputs.launcher3 }}
+  UA_GPUCOMP: ${{ inputs.gpu_composition }}
 
 jobs:
   build:
@@ -165,8 +183,9 @@ jobs:
       # The 7-inch Tab 2 has a landscape panel that LineageOS runs rotated (ro.sf.hwrotation=270) so that the tablet is a portrait device,
       # turning the touchscreen and sensor axes along with it (LineageOS: init.espresso.variant.sh). Android 6.0.1's own SurfaceFlinger
       # ignores that property, so LineageOS 13 patches SurfaceFlinger (frameworks/native) and a few frameworks/base files; the Unlegacy
-      # tree has none of it, so it boots in landscape. This step adds all of it; the script's header explains each part.
-      # It stops with an error if the Unlegacy tree no longer looks the way the script expects, so a build never gets half a patch.
+      # tree has none of it, so it boots in landscape. This step adds all of it, plus the fix for the screen-off animation (ColorFade);
+      # the script's header explains each part. It stops with an error if the Unlegacy tree no longer looks the way the script expects,
+      # so a build never gets half a patch.
       - name: Apply the 7-inch portrait fix (portrait_7in)
         if: ${{ inputs.portrait_7in }}
         run: |
@@ -178,7 +197,7 @@ jobs:
           # The 7" Tab 2 has a 1024x600 panel that is mounted turned by 90 degrees. LineageOS runs it rotated
           # (ro.sf.hwrotation=270) so that the tablet is a portrait device, and turns the touchscreen and the accelerometer/compass
           # axes with it. Android 6.0.1's own SurfaceFlinger does NOT read ro.sf.hwrotation (the property is simply ignored), so
-          # LineageOS carries a small patch for it, and so does this script. Five things are done:
+          # LineageOS carries a small patch for it, and so does this script. Six things are done:
           #   1. device/samsung/espresso/device-common.mk:  ro.sf.hwrotation=270 (goes into /system/build.prop)
           #   2. device/samsung/espresso/rootdir/init.espresso.rc:  "on property:ro.sf.hwrotation=270" -> touchscreen pivot = 1
           #   3. device/samsung/espresso/libsensors/SensorBase.cpp (+ init.espresso.sensors.rc):  accelerometer and magnetometer
@@ -187,6 +206,10 @@ jobs:
           #      reports 600x1024, and the display transform is turned by the extra rotation. THIS is the part that makes the screen
           #      itself portrait; the first version of this fix lacked it, so the screen stayed landscape while the touchscreen turned.
           #   5. frameworks/base (3 files):  LineageOS' matching hooks for screenshots and for the rotation animation.
+          #   6. frameworks/base ColorFade.java (the screen-off / screen-on fade):  it draws a screenshot, and SurfaceFlinger delivers that
+          #      screenshot in the orientation of the panel itself (1024x600, lying on its side), but the fade draws it into a portrait
+          #      600x1024 surface without turning it back, so the last frame appeared turned by 90 degrees and squeezed. The fix turns the
+          #      texture coordinates by the panel rotation. (A pixel simulation of the SurfaceFlinger transforms shows it is exact.)
           # Everything except the property does nothing unless ro.sf.hwrotation is set. Safe to run twice; stops with an error if the
           # expected text is not where it should be (so a changed Unlegacy tree never gets half a patch).
           import os
@@ -460,10 +483,184 @@ jobs:
               (GS_FIELD_OLD, GS_FIELD_OLD + "\n" + MSF_FIELD),
               (GS_ROT_OLD, GS_ROT_NEW)))
 
+          # ===== 6. ColorFade: the screen-off / screen-on fade ======================================================================
+          # The four texture coordinates belong to the quad's corners (0,0) (0,h) (w,h) (w,0). The screenshot is the picture as it lies on
+          # the panel, i.e. the natural picture turned clockwise by the panel rotation, so each corner has to read the point of the
+          # screenshot that the display transform moved there. For 270 degrees that is (1,0) (0,0) (0,1) (1,1); for 0 degrees nothing changes.
+          CF = "frameworks/base/services/core/java/com/android/server/display"
+          CF_OLD = r'''            mTexCoordBuffer.put(0, 0f); mTexCoordBuffer.put(1, 0f);
+                      mTexCoordBuffer.put(2, 0f); mTexCoordBuffer.put(3, 1f);
+                      mTexCoordBuffer.put(4, 1f); mTexCoordBuffer.put(5, 1f);
+                      mTexCoordBuffer.put(6, 1f); mTexCoordBuffer.put(7, 0f);
+          '''
+          CF_NEW = r'''            // The screenshot is in the orientation of the physical panel. When the panel is mounted turned
+                      // (ro.sf.hwrotation, the 7" Tab 2) that is not the natural orientation this surface is drawn in, so
+                      // turn the texture back by the same amount (see the portrait_7in option). 0 degrees: unchanged.
+                      final int panelRotation = (SystemProperties.getInt("ro.sf.hwrotation", 0) / 90) & 3;
+                      if (panelRotation != 0) {
+                          Slog.i(TAG, "Turning the screenshot texture back for the rotated panel (" + (panelRotation * 90) + " degrees)");
+                      }
+                      final float[] cornerU = { 0f, 0f, 1f, 1f };    // corners in vertex order: (0,0) (0,h) (w,h) (w,0)
+                      final float[] cornerV = { 0f, 1f, 1f, 0f };
+                      for (int i = 0; i < 4; i++) {
+                          final float s, t;
+                          switch (panelRotation) {
+                              case 1:  s = cornerV[i];      t = 1f - cornerU[i]; break;
+                              case 2:  s = 1f - cornerU[i]; t = 1f - cornerV[i]; break;
+                              case 3:  s = 1f - cornerV[i]; t = cornerU[i];      break;
+                              default: s = cornerU[i];      t = cornerV[i];      break;
+                          }
+                          mTexCoordBuffer.put(2 * i, s);
+                          mTexCoordBuffer.put(2 * i + 1, t);
+                      }
+          '''
+          edit(CF + "/ColorFade.java", "panelRotation", replacing((CF_OLD, CF_NEW)))
+
           print("portrait fix: done (7-inch Tab 2 will boot in portrait)")
           PYEOF
           python3 /ua/apply-portrait-7in.py /ua/src
           for d in device/samsung/espresso frameworks/native frameworks/base; do
+            echo "== $d"; git -C "/ua/src/$d" diff --stat
+          done
+
+      # Unlegacy lists the Android 4 style Launcher2 in build/target/product/core.mk. AOSP 6.0.1 also contains Launcher3 (the Android 6
+      # launcher, and it is in the manifest), so the swap is one word in one makefile. The script first checks that Launcher3 is in the tree.
+      - name: Use Launcher3 instead of Launcher2 (launcher3)
+        if: ${{ inputs.launcher3 }}
+        run: |
+          cat > /ua/apply-launcher3.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # Swaps the home screen app: Launcher2 (the Android 4 launcher that Unlegacy ships) -> Launcher3 (the Android 6 launcher of AOSP 6.0.1).
+          # Usage: apply-launcher3.py <root of the Android source tree>
+          #
+          # Both launchers are in the AOSP 6.0.1 source (packages/apps/Launcher2 and packages/apps/Launcher3, both in the Unlegacy manifest).
+          # Unlegacy's build tree simply lists Launcher2 in build/target/product/core.mk, and that is the only place that names a launcher
+          # (nothing in the device or vendor trees does), so the swap is one word in one makefile. It checks first that Launcher3 really
+          # is in the synced tree, so a build never starts with a launcher that cannot be built. Safe to run twice.
+          import os
+          import re
+          import sys
+
+          ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
+
+
+          def fail(msg):
+              print("::error::launcher3: " + msg)
+              sys.exit(1)
+
+
+          amk = os.path.join(ROOT, "packages/apps/Launcher3/Android.mk")
+          if not os.path.isfile(amk):
+              fail("packages/apps/Launcher3/Android.mk is not in the synced source tree")
+          with open(amk, encoding="utf-8", errors="replace") as f:
+              amk_text = f.read()
+          if not re.search(r"^\s*LOCAL_PACKAGE_NAME\s*:=\s*Launcher3\s*$", amk_text, re.M):
+              fail("packages/apps/Launcher3/Android.mk does not define the package Launcher3")
+          for line in amk_text.splitlines():
+              if re.match(r"\s*(LOCAL_PACKAGE_NAME|LOCAL_OVERRIDES_PACKAGES|LOCAL_PRIVILEGED_MODULE|LOCAL_SDK_VERSION|LOCAL_MIN_SDK_VERSION)\b", line):
+                  print("  Launcher3/Android.mk: " + line.strip())
+
+          core = os.path.join(ROOT, "build/target/product/core.mk")
+          if not os.path.isfile(core):
+              fail("build/target/product/core.mk does not exist")
+          with open(core, encoding="utf-8", newline="") as f:
+              text = f.read()
+
+          OLD = "    Launcher2 \\\n"
+          NEW = "    Launcher3 \\\n"
+          if text.count(NEW) == 1 and text.count(OLD) == 0:
+              print("  already patched: build/target/product/core.mk")
+          else:
+              if text.count(OLD) != 1:
+                  fail("expected '    Launcher2 \\' exactly once in build/target/product/core.mk, found %d; the Unlegacy tree has changed" % text.count(OLD))
+              with open(core, "w", encoding="utf-8", newline="") as f:
+                  f.write(text.replace(OLD, NEW, 1))
+              print("  patched: build/target/product/core.mk (Launcher2 -> Launcher3)")
+
+          print("launcher3: done (the home screen will be AOSP's Launcher3)")
+          PYEOF
+          python3 /ua/apply-launcher3.py /ua/src
+          git -C /ua/src/build diff --stat
+
+      # SurfaceFlinger gets a boot-time property, ro.sf.force_gles_composition, that sets the same switch as Developer options ->
+      # "Disable HW overlays": every layer is composed with OpenGL ES and none goes to the hardware composer (a prebuilt IMG blob that
+      # seems to mis-order layers). Aimed at the see-through notification shade and the flash before the rotation animation.
+      # Independent of portrait_7in (it also applies to the 10.1-inch models).
+      - name: Compose the screen with the GPU only (gpu_composition)
+        if: ${{ inputs.gpu_composition }}
+        run: |
+          cat > /ua/apply-gpu-composition.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # Makes SurfaceFlinger compose every frame with the GPU, from boot on, instead of handing layers to the display's hardware overlays.
+          # Usage: apply-gpu-composition.py <root of the Android source tree>
+          #
+          # Why: on the flashed builds the notification shade is see-through (screenshots of it look right) and, at a screen rotation, the new
+          # screen shows for a moment before the rotation animation. Both look like the same kind of fault: the tablet's hardware composer
+          # (a prebuilt IMG SGX blob) mis-orders layers when SurfaceFlinger composes some of them itself (the snapshot of the old screen
+          # during a rotation, a translucent window) and hands the rest to the overlays. "Show CPU usage" in Developer options adds one more
+          # layer than the overlays can take, which makes the composer give up and everything is drawn with OpenGL ES, and that made the
+          # shade look right. That is a guess about the cause; what is certain is that it is the same state this option creates.
+          # What it does: Android's SurfaceFlinger already has a switch for it, Developer options -> "Disable HW overlays" (it marks every layer
+          # "skip", so none is given to the composer). It is only reachable at run time and resets at every boot. This patch reads the property
+          # ro.sf.force_gles_composition once, when SurfaceFlinger starts, and sets that same switch; device-common.mk sets the property to 1.
+          # Cost: the GPU draws every frame (a little more power; video is composed by the GPU too). To compare without rebuilding:
+          # Developer options -> tick, then untick "Disable HW overlays" turns the overlays back on until the next reboot.
+          # Safe to run twice; stops with an error if the expected text is not where it should be.
+          import os
+          import sys
+
+          ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
+          DEV = "device/samsung/espresso"
+          SF = "frameworks/native/services/surfaceflinger"
+          PROP = "ro.sf.force_gles_composition"
+
+
+          def fail(msg):
+              print("::error::gpu composition: " + msg)
+              sys.exit(1)
+
+
+          def patch(rel, marker, old, new):
+              path = os.path.join(ROOT, rel)
+              if not os.path.isfile(path):
+                  fail(rel + " does not exist")
+              with open(path, encoding="utf-8", newline="") as f:
+                  text = f.read()
+              if marker in text:
+                  print("  already patched: " + rel)
+                  return
+              if text.count(old) != 1:
+                  fail("expected text found %d times (need exactly 1) in %s; the Unlegacy tree has changed:\n%s" % (text.count(old), rel, old))
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  f.write(text.replace(old, new, 1))
+              print("  patched: " + rel)
+
+
+          # 1. SurfaceFlinger reads the property once at start-up and sets mDebugDisableHWC (the switch behind "Disable HW overlays")
+          SF_OLD = '    ALOGI_IF(mDebugRegion, "showupdates enabled");\n'
+          SF_NEW = (
+              "    // gpu_composition option: compose every layer with OpenGL ES, none with the hardware composer's overlays. This is what\n"
+              "    // Developer options -> \"Disable HW overlays\" does (transaction 1008), but from boot on.\n"
+              '    property_get("' + PROP + '", value, "0");\n'
+              "    mDebugDisableHWC = atoi(value) ? 1 : 0;\n"
+              '    ALOGI_IF(mDebugDisableHWC, "every layer is composed with the GPU (' + PROP + ')");\n'
+              + SF_OLD)
+          patch(SF + "/SurfaceFlinger.cpp", PROP, SF_OLD, SF_NEW)
+
+          # 2. the property itself, next to the other display properties (this anchor is also the one the portrait_7in patch builds on; both
+          #    orders of the two patches work)
+          MK_OLD = "    ro.opengles.version=131072 \\\n    ro.sf.lcd_density=160\n"
+          MK_NEW = MK_OLD + (
+              "\n"
+              "# Compose every frame with the GPU (see the gpu_composition option); SurfaceFlinger reads this once at start-up.\n"
+              "PRODUCT_PROPERTY_OVERRIDES += \\\n"
+              "    " + PROP + "=1\n")
+          patch(DEV + "/device-common.mk", PROP, MK_OLD, MK_NEW)
+
+          print("gpu composition: done (SurfaceFlinger will compose everything with the GPU)")
+          PYEOF
+          python3 /ua/apply-gpu-composition.py /ua/src
+          for d in device/samsung/espresso frameworks/native; do
             echo "== $d"; git -C "/ua/src/$d" diff --stat
           done
 
@@ -591,6 +788,40 @@ jobs:
               echo "::warning::portrait fix: not everything was found in the finished image"
             fi
           fi
+          # the screen-off fix is Java code in services.jar (or services.odex when the build is pre-optimised): look for the log line it adds
+          fade="screen-off fix: not applied (portrait_7in was off)"
+          if [ "$UA_PORTRAIT" = "true" ]; then
+            dexbin=$(mktemp)
+            { unzip -p "$out/system/framework/services.jar" classes.dex 2>/dev/null || true; cat "$out"/system/framework/oat/*/services.odex 2>/dev/null || true; } > "$dexbin"
+            if grep -qa 'Turning the screenshot texture back' "$dexbin"; then
+              fade="screen-off fix: found in the finished image (services)"
+            else
+              fade="screen-off fix: applied to the source, but not found in the finished image (it may just be stored in a form this check cannot read) - check the log"
+              echo "::warning::screen-off fix: not found in the finished image"
+            fi
+            rm -f "$dexbin"
+          fi
+          launcher="launcher3: not applied (launcher3 was off)"
+          if [ "$UA_LAUNCHER3" = "true" ]; then
+            l3=$(find "$out/system/priv-app" "$out/system/app" -maxdepth 2 -name 'Launcher3.apk' -print -quit 2>/dev/null || true)
+            l2=$(find "$out/system/priv-app" "$out/system/app" -maxdepth 2 -name 'Launcher2.apk' -print -quit 2>/dev/null || true)
+            if [ -n "$l3" ] && [ -z "$l2" ]; then
+              launcher="launcher3: found in the finished image (${l3#"$out"/}); Launcher2 is gone"
+            else
+              launcher="launcher3: applied to the source, but the finished image has Launcher3='${l3:-none}' and Launcher2='${l2:-none}' - check the log"
+              echo "::warning::launcher3: unexpected launcher apps in the finished image"
+            fi
+          fi
+          gpu="gpu_composition: not applied (gpu_composition was off)"
+          if [ "$UA_GPUCOMP" = "true" ]; then
+            if grep -q '^ro.sf.force_gles_composition=1$' "$out/system/build.prop" 2>/dev/null \
+               && grep -qa 'ro.sf.force_gles_composition' "$out/system/lib/libsurfaceflinger.so" 2>/dev/null; then
+              gpu="gpu_composition: found in the finished image (ro.sf.force_gles_composition=1 in build.prop, read by SurfaceFlinger)"
+            else
+              gpu="gpu_composition: applied to the source, but NOT everything was found in the finished image - check the log"
+              echo "::warning::gpu_composition: not everything was found in the finished image"
+            fi
+          fi
           if [ -n "${ARTIFACT_PASSPHRASE:-}" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$n" -out "$n.enc" -pass env:ARTIFACT_PASSPHRASE
             rm -f "$n"
@@ -607,6 +838,9 @@ jobs:
             echo "- sha256: \`$(cut -d' ' -f1 "$n.sha256")\`"
             echo "- $how"
             echo "- $portrait"
+            echo "- $fade"
+            echo "- $launcher"
+            echo "- $gpu"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ROM zip
