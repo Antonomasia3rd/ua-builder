@@ -21,10 +21,13 @@ name: Build Unlegacy-Android 6.0 (Galaxy Tab 2)
 #          squeezed; (b) at a screen rotation the new content shows for a split second before the rotation animation plays; (c) the
 #          launcher is still the Android 4 style Launcher2; (d) the notification shade is see-through (not in screenshots; "Show CPU
 #          usage" hides it).
-#  this version: (a) is fixed inside the portrait_7in step (ColorFade turns its screenshot back; checked with a pixel simulation);
-#          (c) is the new launcher3 option; (b) and maybe (d) are the target of the new gpu_composition option: SurfaceFlinger composes every
-#          layer with the GPU from boot on, like Developer options -> "Disable HW overlays" (a best guess, not proven).
-#          All three are on by default; untick portrait_7in for the 10.1-inch models, or any of them to build without it.
+#  third version (2026-11-09): (a) fixed inside the portrait_7in step (ColorFade turns its screenshot back), (c) the new launcher3
+#          option, (b)+(d) the new gpu_composition option. FAILED to compile: services.core, ColorFade.java:514 "Duplicate local variable s"
+#          (the new loop declared `s` in a method that already has one). Nothing else was reported as failed.
+#  this version (2026-11-10): the ColorFade variables are renamed (texS, texT, corner). Tested by hand on the second build before this:
+#          Developer options -> "Disable HW overlays" removes both (b) and (d) (and may feel laggier), which is exactly the state the
+#          gpu_composition option creates from boot on (SurfaceFlinger reads ro.sf.force_gles_composition and sets that same switch).
+#          All three options are on by default; untick portrait_7in for the 10.1-inch models, or any of them to build without it.
 on:
   workflow_dispatch:
     inputs:
@@ -487,6 +490,10 @@ jobs:
           # The four texture coordinates belong to the quad's corners (0,0) (0,h) (w,h) (w,0). The screenshot is the picture as it lies on
           # the panel, i.e. the natural picture turned clockwise by the panel rotation, so each corner has to read the point of the
           # screenshot that the display transform moved there. For 270 degrees that is (1,0) (0,0) (0,1) (1,1); for 0 degrees nothing changes.
+          # NOTE on names: this block sits inside captureScreenshotTextureAndSetViewport(), which already has locals called st and s (a
+          # SurfaceTexture and its Surface). Java forbids declaring a local again inside a nested block, so every name below (texS, texT,
+          # corner, ...) was checked against the whole method; the first version of this patch used s and t and broke the build
+          # ("Duplicate local variable s"). tools: stubcheck.py compiles the whole patched file and would have caught it.
           CF = "frameworks/base/services/core/java/com/android/server/display"
           CF_OLD = r'''            mTexCoordBuffer.put(0, 0f); mTexCoordBuffer.put(1, 0f);
                       mTexCoordBuffer.put(2, 0f); mTexCoordBuffer.put(3, 1f);
@@ -502,16 +509,16 @@ jobs:
                       }
                       final float[] cornerU = { 0f, 0f, 1f, 1f };    // corners in vertex order: (0,0) (0,h) (w,h) (w,0)
                       final float[] cornerV = { 0f, 1f, 1f, 0f };
-                      for (int i = 0; i < 4; i++) {
-                          final float s, t;
+                      for (int corner = 0; corner < 4; corner++) {
+                          final float texS, texT;
                           switch (panelRotation) {
-                              case 1:  s = cornerV[i];      t = 1f - cornerU[i]; break;
-                              case 2:  s = 1f - cornerU[i]; t = 1f - cornerV[i]; break;
-                              case 3:  s = 1f - cornerV[i]; t = cornerU[i];      break;
-                              default: s = cornerU[i];      t = cornerV[i];      break;
+                              case 1:  texS = cornerV[corner];      texT = 1f - cornerU[corner]; break;
+                              case 2:  texS = 1f - cornerU[corner]; texT = 1f - cornerV[corner]; break;
+                              case 3:  texS = 1f - cornerV[corner]; texT = cornerU[corner];      break;
+                              default: texS = cornerU[corner];      texT = cornerV[corner];      break;
                           }
-                          mTexCoordBuffer.put(2 * i, s);
-                          mTexCoordBuffer.put(2 * i + 1, t);
+                          mTexCoordBuffer.put(2 * corner, texS);
+                          mTexCoordBuffer.put(2 * corner + 1, texT);
                       }
           '''
           edit(CF + "/ColorFade.java", "panelRotation", replacing((CF_OLD, CF_NEW)))
